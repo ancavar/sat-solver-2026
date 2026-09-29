@@ -1,6 +1,7 @@
 import sys
 from threading import Event
-from utils import SATSolverResult, load_formula, lit_to_dimacs
+
+from utils import SATSolverResult, lit_to_dimacs, load_formula
 
 
 class Solver:
@@ -26,6 +27,7 @@ class Solver:
         self.model = None
 
         self.preprocess()
+        self.build_occurrences()
 
     def preprocess(self):
         """
@@ -34,7 +36,7 @@ class Solver:
           units            — литералы единичных дизъюнктов
           has_empty_clause — во входе есть пустой дизъюнкт (формула невыполнима)
         """
-        self.clauses = []
+        self.clauses: list[list[int]] = []
         self.units = []
         self.has_empty_clause = False
         for clause in self.formula.clauses:
@@ -82,8 +84,12 @@ class Solver:
 
     def save_model(self):
         values = self.values
-        self.model = [lit_to_dimacs(2 * v if values[2 * v] > 0 else 2 * v + 1)
-                      for v in range(1, self.num_vars + 1)]
+        self.model = [
+            lit_to_dimacs(2 * v if values[2 * v] > 0 else 2 * v + 1)
+            ## а прописать в РИДМИ  что v от 1 начинается????
+            ## изначально было от 1, щас на 0 переделал
+            for v in range(self.num_vars)
+        ]
 
     def build_occurrences(self):
         self.occurrences = [[] for _ in range(self.formula.num_lits)]
@@ -108,19 +114,132 @@ class Solver:
         UnitPropagate: распространить литералы trail[propagated:].
         Возвращает True, если найден конфликт (все литералы дизъюнкта ложны).
         """
-        raise NotImplementedError()
+        while self.propagated < len(self.trail):
+            l = self.trail[self.propagated]
+            self.propagated = self.propagated + 1
 
-    def choose_literal(self):
+            # смотрим clause в которых есть еще не propogated переменная
+            # так как они оттуда можем получить новые
+            for c in self.occurrences[l ^ 1]:
+                free_vars = 0
+                free_var_id = 0
+                flag = False
+                for l2 in c:
+                    # одна из переменных True
+                    if self.values[l2] == 1:
+                        # таким образом плевать на остальные
+                        flag = True
+                        break
+                    if self.values[l2] == 0:
+                        free_vars = free_vars + 1
+                        free_var_id = l2
+                if flag:
+                    continue
+                # дальше получаем что мы не нашли ни одно тру значение
+                # все переменные False
+                if free_vars == 0:
+                    return True
+                # одна свободная => ДОЛЖНА быть True
+                if free_vars == 1:
+                    self.assign(free_var_id)
+                # откладываем на потом(не знаем сейчас)
+                if free_vars >= 2:
+                    continue
+            # self.eliminate_pure_literals()
+        return False
+
+    def find_pure_literals(self) -> list[int]:
+        seen = [False] * self.formula.num_lits
+
+        for c in self.clauses:
+            for l in c:
+                seen[l] = True
+
+        pure_literals = []
+        for i in range(0, len(seen), 2):
+            if seen[i] and not seen[i + 1]:
+                pure_literals.append(i)
+
+            if not seen[i] and seen[i + 1]:
+                pure_literals.append(i + 1)
+
+        return pure_literals
+
+    def eliminate_pure_literals(self) -> None:
+        for l in self.find_pure_literals():
+            self.assign(l)
+
+    def choose_literal(self) -> int | None:
         """
         ChooseLiteral: литерал для следующего решения или None, если все
         переменные означены.
         """
-        raise NotImplementedError()
+        for i, v in enumerate(self.values):
+            if v == 0:
+                return i
+        return None
 
-    def solve(self) -> SATSolverResult:
+    def is_solved(self):
+        for v in self.values:
+            if v == 0:
+                return False
+        return True
+
+    def solve_helper(self) -> SATSolverResult:
+
         if self.sigkill.is_set():  # TODO: your code should check this predicate frequently! If it is set, you should return
             return SATSolverResult.UNKNOWN
-        raise NotImplementedError()
+        l = self.choose_literal()
+        # 1. смотрим если все подобрали
+        if l is None:
+            return SATSolverResult.SAT
+
+        self.decide(l)
+
+        if not self.propagate():
+            # если нет конфликта и решили то ура гг победа
+            if self.is_solved():
+                return SATSolverResult.SAT
+            # если нет конфликта и не решили то снова выбираем литерал
+            if self.solve_helper() == SATSolverResult.SAT:
+                return SATSolverResult.SAT
+
+        # 2. если есть конфликт то бектрекаем и пробуем -l
+        self.backtrack(self.level() - 1)
+        self.decide(l ^ 1)
+
+        if not self.propagate():
+            # если нет конфликта и решили то ура гг победа
+            if self.is_solved():
+                return SATSolverResult.SAT
+            # если нет конфликта и не решили то снова выбираем литерал
+            if self.solve_helper() == SATSolverResult.SAT:
+                return SATSolverResult.SAT
+
+        # 3. если есть конфликт то бектрекаем и всё, возвращаемся обратно рекурсивно так как проебали для l и -l
+        self.backtrack(self.level() - 1)
+        return SATSolverResult.UNSAT
+
+    def solve(self) -> SATSolverResult:
+        # чекаем один раз изначальные юниты так как это БАЗА
+        for l in self.units:
+            if self.values[l ^ 1] == 1:
+                return SATSolverResult.UNSAT
+            self.assign(l)
+        # пропагейтим их
+        if self.propagate():
+            return SATSolverResult.UNSAT
+        # и смотрим если решили
+        if self.is_solved():
+            return SATSolverResult.SAT
+
+        if self.has_empty_clause:
+            return SATSolverResult.UNSAT
+        if len(self.clauses) == 0:
+            return SATSolverResult.SAT
+        res = self.solve_helper()
+        self.save_model()
+        return res
 
 
 if __name__ == "__main__":
